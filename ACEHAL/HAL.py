@@ -11,6 +11,7 @@ import ase.io
 from ase.md.langevin import Langevin
 from ase import units
 from ase.calculators.calculator import PropertyNotImplementedError
+from ase.db import connect
 
 from ACEHAL.fit import fit
 from ACEHAL.basis import define_basis
@@ -24,7 +25,7 @@ def HAL(fit_configs, traj_configs, basis_source, solver, fit_kwargs, n_iters, re
          traj_len, dt_fs, tol, tau_rel, T_K, P_GPa=None, cell_fixed_shape=False, T_timescale_fs=100, tol_eps=0.1, tau_hist=100,
          cell_step_interval=10, swap_step_interval=0, cell_step_mag=0.01,
          default_basis_info=None, basis_optim_kwargs=None, basis_optim_interval=None,
-         file_root=None, traj_interval=10, test_configs=[], test_fraction=0.0):
+         file_root=None, traj_interval=10, test_configs=[], test_fraction=0.0,id_list=None,database_name=None):
     """Iterate with hyperactive learning
 
     Parameters
@@ -153,6 +154,8 @@ def HAL(fit_configs, traj_configs, basis_source, solver, fit_kwargs, n_iters, re
     # prepare lists for new configs
     new_fit_configs = []
     new_test_configs = []
+    if database_name is not None :
+        IDs_in_new_fit_configs = []
 
     for iter_HAL in range(n_iters):
         HAL_label = _HAL_label(iter_HAL)
@@ -285,22 +288,9 @@ def HAL(fit_configs, traj_configs, basis_source, solver, fit_kwargs, n_iters, re
             new_config.calc = ref_calc
 
             data_keys = fit_kwargs['data_keys']
-            if 'E' in data_keys:
-                try:
-                    E = new_config.get_potential_energy(force_consistent=True)
-                except PropertyNotImplementedError:
-                    warnings.warn(f"No force_consistent=True energy found for new config with reference calculator {ref_calc}")
-                    E = new_config.get_potential_energy()
-                new_config.info[data_keys['E']] = E
-            if 'F' in data_keys:
-                F = new_config.get_forces()
-                new_config.new_array(data_keys['F'], F)
-            if 'V' in data_keys:
-                try:
-                    V = - new_config.get_volume() * new_config.get_stress(voigt=False)
-                    new_config.info[data_keys['V']] = V
-                except PropertyNotImplementedError:
-                    warnings.warn(f"No stress for new config with reference calculator {ref_calc}")
+
+            data_keys_writer(new_config,ref_calc,data_keys)
+
             print("TIMING reference_calc", time.time() - t0)
 
         # save new config to fit or test set
@@ -309,6 +299,33 @@ def HAL(fit_configs, traj_configs, basis_source, solver, fit_kwargs, n_iters, re
             # fit config chosen
             new_fit_configs.append(new_config)
             new_config_file = file_root.parent / (file_root.name + f".config_fit.{HAL_label}.extxyz")
+            # Use a database if the option has been chosen
+            if database_name is not None:
+                try:
+                    db = connect(database_name)
+                except:
+                    print("Database connection failed")
+                else:
+                    id = db.reserve()
+                    IDs_in_new_fit_configs.append(id)
+                    db_ID_list = [i.get('id') for i in db.select(columns=['id'])]
+                    new_IDs = [i for i in db_ID_list if i not in id_list+IDs_in_new_fit_configs]#list(set(db_ID_list)-set(id_list)-set(IDs_in_new_fit_configs))
+                    db_configs_list =[db.get(i) for i in new_IDs]
+                    for entry in db_configs_list:
+                        try : 
+                            db_entry = entry.toatoms()
+                        except :
+                            print("Could not convert database row to atoms")
+                        else:
+                            dbStress = entry.data[data_keys['V']]
+                            data_keys_writer(db_entry,db_entry.calc,data_keys,db_stress=dbStress)
+                            fit_configs.append(db_entry)
+                    id_list.append(new_IDs)    
+                    try:
+                        db.write(new_config,id=id,data={data_keys['V']:new_config.info[data_keys['V']]})
+                        print("Configuration written to db")
+                    except:
+                        print("Configuration failed to write to database") 
 
             if ref_calc is not None:
                 # cause a refit below, whether or not basis is re-optimized
@@ -319,7 +336,7 @@ def HAL(fit_configs, traj_configs, basis_source, solver, fit_kwargs, n_iters, re
             new_config_file = file_root.parent / (file_root.name + f".config_test.{HAL_label}.extxyz")
 
         ase.io.write(new_config_file, new_config)
-
+    
         if (basis_optim_kwargs is not None and basis_optim_interval is not None and
             iter_HAL % basis_optim_interval == basis_optim_interval - 1):
             t0 = time.time()
@@ -343,7 +360,7 @@ def HAL(fit_configs, traj_configs, basis_source, solver, fit_kwargs, n_iters, re
             print("FIT ERROR TABLE")
             print(viz.error_table(error_configs, committee_calc, fit_kwargs["data_keys"]).to_string())
             print("TIMING fit", time.time() - t0)
-
+        
     # return fit configs, final basis_info, and optionally test configs
     if test_fraction > 0.0:
         return new_fit_configs, basis_info, new_test_configs
@@ -411,3 +428,41 @@ def _fit(fit_configs, solver, fit_kwargs, B_len_norm, file_root, HAL_label):
     viz.plot_dimers(committee_calc, list(fit_kwargs["E0s"]), plot_dimers_file)
 
     return committee_calc
+
+def data_keys_writer(new_config,ref_calc,data_keys,db_stress=None):
+    if 'E' in data_keys:
+        try:
+            E = new_config.get_potential_energy(force_consistent=True)
+        except PropertyNotImplementedError:
+            warnings.warn(f"No force_consistent=True energy found for new config with reference calculator {ref_calc}")
+            E = new_config.get_potential_energy()
+        new_config.info[data_keys['E']] = E
+    if 'F' in data_keys:
+        F = new_config.get_forces()
+        new_config.new_array(data_keys['F'], F)
+    if 'V' in data_keys:
+        if db_stress is not None:
+            new_config.info[data_keys['V']] = db_stress
+        else:
+            try:
+                V = - new_config.get_volume() * new_config.get_stress(voigt=False)
+                new_config.info[data_keys['V']] = V
+            except PropertyNotImplementedError:
+                warnings.warn(f"No stress for new config with reference calculator {ref_calc}")
+            
+def db_read_t(name,data_keys):
+    db = connect(name)
+    configs = []
+    db_ID_list = []
+    for row in db.select():
+        db_ID_list.append(row.id)
+        temp = row.toatoms()    
+        try:
+            temp.info.update({data_keys['E']:row.energy})
+        except:
+            print("Could not get energy possible bad entry, this will not be added to configs. ID in db is ",row.id)
+        else:
+            temp.info.update({data_keys['V']:row.data[data_keys['V']]})
+            temp.new_array(data_keys['F'],row.forces)
+            configs.append(temp)
+    return configs,db_ID_list
